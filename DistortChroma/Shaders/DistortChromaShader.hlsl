@@ -6,6 +6,15 @@ SamplerState InputSampler : register(s0)
     AddressV = CLAMP;
 };
 
+// ★ マップ（ノーマル計算元ソース）用のテクスチャを追加
+Texture2D MapTexture : register(t1);
+SamplerState MapSampler : register(s1)
+{
+    Filter = MIN_MAG_MIP_LINEAR;
+    AddressU = CLAMP;
+    AddressV = CLAMP;
+};
+
 cbuffer Constants : register(b0)
 {
     float Amount;
@@ -31,21 +40,20 @@ float2 PixelToUVOffset(float2 pixelOffset, float2 duvdx, float2 duvdy)
     return pixelOffset.x * duvdx + pixelOffset.y * duvdy;
 }
 
-// ★改良1：微細なノイズを拾わず、滑らかで大きな「うねり」を抽出する
-float3 computeNormal(float2 uv, float angle_val, float2 duvdx, float2 duvdy, float blurStrength)
+// 法線計算は t1 (MapTexture) からサンプリングするため、map_uv とその偏微分を使用します
+float3 computeNormal(float2 map_uv, float angle_val, float2 dmap_dx, float2 dmap_dy, float blurStrength)
 {
-    // ぼかしが強いほど、差分を取る距離を広げてノイズを潰す
     float sampleDist = 2.0 + (blurStrength * 0.5);
     
-    float2 offX = PixelToUVOffset(float2(sampleDist, 0.0), duvdx, duvdy);
-    float2 offY = PixelToUVOffset(float2(0.0, sampleDist), duvdx, duvdy);
+    float2 offX = PixelToUVOffset(float2(sampleDist, 0.0), dmap_dx, dmap_dy);
+    float2 offY = PixelToUVOffset(float2(0.0, sampleDist), dmap_dx, dmap_dy);
     
-    float gx = getLuminance(InputTexture.SampleLevel(InputSampler, uv + offX, 0).rgb)
-             - getLuminance(InputTexture.SampleLevel(InputSampler, uv - offX, 0).rgb);
-    float gy = getLuminance(InputTexture.SampleLevel(InputSampler, uv + offY, 0).rgb)
-             - getLuminance(InputTexture.SampleLevel(InputSampler, uv - offY, 0).rgb);
+    // t1 から輝度差分を計算
+    float gx = getLuminance(MapTexture.SampleLevel(MapSampler, map_uv + offX, 0).rgb)
+             - getLuminance(MapTexture.SampleLevel(MapSampler, map_uv - offX, 0).rgb);
+    float gy = getLuminance(MapTexture.SampleLevel(MapSampler, map_uv + offY, 0).rgb)
+             - getLuminance(MapTexture.SampleLevel(MapSampler, map_uv - offY, 0).rgb);
              
-    // 抽出した差分から滑らかな法線ベクトルを作る
     float3 normal = normalize(float3(-gx * 4.0, -gy * 4.0, 1.0));
     
     float rad = angle_val * 3.14159265359 / 180.0;
@@ -60,17 +68,16 @@ float3 computeNormal(float2 uv, float angle_val, float2 duvdx, float2 duvdy, flo
     return normal * 0.5 + 0.5;
 }
 
-// ★改良2：バキバキにならない、滑らかで安定したガウス風ブラー
-float3 smoothNormalBlur(float2 uv, float blurStrength, float angle_val, float2 duvdx, float2 duvdy)
+float3 smoothNormalBlur(float2 map_uv, float blurStrength, float angle_val, float2 dmap_dx, float2 dmap_dy)
 {
     if (blurStrength <= 0.01)
-        return computeNormal(uv, angle_val, duvdx, duvdy, 0.0);
+        return computeNormal(map_uv, angle_val, dmap_dx, dmap_dy, 0.0);
     
     float3 result = float3(0, 0, 0);
     float totalWeight = 0.0;
     
-    int radius = 4; // サンプル範囲を少し広げて滑らかに
-    float stride = 1.0 + (blurStrength * 0.3); // 広げすぎによる多重影を防ぐ
+    int radius = 4;
+    float stride = 1.0 + (blurStrength * 0.3);
     float sigma = (float) radius * 0.5;
 
     [loop]
@@ -80,23 +87,29 @@ float3 smoothNormalBlur(float2 uv, float blurStrength, float angle_val, float2 d
         for (int y = -radius; y <= radius; y++)
         {
             float2 pixelOffset = float2(x, y) * stride;
-            float2 uvOffset = PixelToUVOffset(pixelOffset, duvdx, duvdy);
+            float2 uvOffset = PixelToUVOffset(pixelOffset, dmap_dx, dmap_dy);
             
-            // ガウス関数による重み付け（中心に近いほど濃く、外ほど薄く拾う）
             float distSq = (x * x + y * y);
             float weight = exp(-distSq / (2.0 * sigma * sigma));
             
-            result += computeNormal(uv + uvOffset, angle_val, duvdx, duvdy, blurStrength) * weight;
+            result += computeNormal(map_uv + uvOffset, angle_val, dmap_dx, dmap_dy, blurStrength) * weight;
             totalWeight += weight;
         }
     }
     return result / totalWeight;
 }
 
-float4 main(float4 pos : SV_POSITION, float4 posScene : SCENE_POSITION, float4 uv0 : TEXCOORD0) : SV_Target
+float4 main(
+    float4 pos : SV_POSITION,
+    float4 posScene : SCENE_POSITION,
+    float4 uv0 : TEXCOORD0,
+    float4 uv1 : TEXCOORD1 // ★ t1 (MapTexture) 用のUV座標を受け取る
+) : SV_Target
 {
     float2 uv = uv0.xy;
+    float2 map_uv = uv1.xy; // ★ MapTexture のサンプリングにはこれを使用する
     
+    // ベース画像のアルファは t0 (InputTexture) を使用
     float originalAlpha = InputTexture.Sample(InputSampler, uv).a;
     if (originalAlpha <= 0.001)
     {
@@ -106,8 +119,11 @@ float4 main(float4 pos : SV_POSITION, float4 posScene : SCENE_POSITION, float4 u
     float2 duvdx = ddx(uv);
     float2 duvdy = ddy(uv);
     
-    // 滑らかな法線を生成
-    float3 normal = smoothNormalBlur(uv, Blur, Angle, duvdx, duvdy);
+    float2 dmap_dx = ddx(map_uv);
+    float2 dmap_dy = ddy(map_uv);
+    
+    // ★ 元のブラー処理（smoothNormalBlur）を維持したまま、バグのない新しい座標系を渡します
+    float3 normal = smoothNormalBlur(map_uv, Blur, Angle, dmap_dx, dmap_dy);
     
     float3 texColor = float3(0.0, 0.0, 0.0);
     float3 blurSum = float3(0.0, 0.0, 0.0);
@@ -128,10 +144,10 @@ float4 main(float4 pos : SV_POSITION, float4 posScene : SCENE_POSITION, float4 u
         float3 blurWeight = (COLOR_R * Chroma.r + COLOR_G * Chroma.g + COLOR_B * Chroma.b);
         blurSum += blurWeight;
         
-        // 歪み適用
         float2 displacementPixel = (normal.xy * 2.0 - 1.0) * Amount * fi;
         float2 displacedUV = uv + PixelToUVOffset(displacementPixel, duvdx, duvdy);
 
+        // 色のサンプリングは描画用である t0 (InputTexture) から行う
         texColor += blurWeight * InputTexture.Sample(InputSampler, displacedUV).rgb;
     }
 

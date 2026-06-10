@@ -28,7 +28,8 @@ namespace DistortChroma
 
         private enum Props { Amount, Blur, Steps, Angle }
 
-        [CustomEffect(1)]
+        // ★入力を2つ（描画用 t0, マップ用 t1）にするため 2 を指定
+        [CustomEffect(2)]
         private class EffectImpl : D2D1CustomShaderEffectImplBase<EffectImpl>
         {
             private ConstantBuffer constants;
@@ -38,7 +39,6 @@ namespace DistortChroma
                 if (drawInformation != null) drawInformation.SetPixelShaderConstantBuffer(constants);
             }
 
-            // ★ ここはそのまま（見た目のアイテムサイズは元の画像の大きさから変更しない）
             public override void MapInputRectsToOutputRect(RawRect[] inputRects, RawRect[] inputOpaqueSubRects, out RawRect outputRect, out RawRect outputOpaqueSubRect)
             {
                 if (inputRects.Length > 0) outputRect = inputRects[0];
@@ -46,10 +46,8 @@ namespace DistortChroma
                 outputOpaqueSubRect = new RawRect();
             }
 
-            // ★ ここを修正（タイルバグを防ぐため、計算に必要な範囲だけメモリに要求する）
             public override void MapOutputRectToInputRects(RawRect outputRect, RawRect[] inputRects)
             {
-                // 歪み(Amount)とぼかし(Blur)で隣のピクセルを覗き込む距離を計算
                 int margin = (int)(Math.Abs(constants.Amount) + constants.Blur * 3.0f) + 5;
 
                 var expandedRect = new RawRect(
@@ -57,8 +55,9 @@ namespace DistortChroma
                     outputRect.Right + margin, outputRect.Bottom + margin
                 );
 
-                // YMM4に対して「はみ出た範囲もタイルに含めて！」と要求する
+                // 入力0（自身）と入力1（マップ）の両方に余白付きの範囲を要求する
                 if (inputRects.Length > 0) inputRects[0] = expandedRect;
+                if (inputRects.Length > 1) inputRects[1] = expandedRect;
             }
 
             private static byte[] LoadShader()
